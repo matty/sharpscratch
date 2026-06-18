@@ -52,7 +52,7 @@
   .fill {
     position: absolute; inset: 0; color: var(--blood);
     text-shadow: 0 0 18px rgba(212,57,43,.25);
-    opacity: 1; clip-path: circle(135% at 50% var(--land));
+    opacity: 1; clip-path: inset(0 0 0 0);
   }
   .drop {
     position: absolute; top: 0; left: 50%;
@@ -129,15 +129,16 @@
     100%    { opacity: 0; }
   }
 
-  /* Blood blooms OUTWARD from the impact point (top-centre of the word):
-     a circle that grows from radius 0 at the 44% impact frame, and stays. */
+  /* Blood floods DOWN the letters from the top edge: the reveal starts the
+     instant the drop lands (44%) and the bottom inset retreats to 0, wiping
+     the red in top-to-bottom across the word. */
   @keyframes ss-fill {
-    0%, 44% { opacity: 1; clip-path: circle(0%   at 50% var(--land)); }
-    48%     { opacity: 1; clip-path: circle(16%  at 50% var(--land)); }  /* small pool wells up where it lands */
-    56%     { opacity: 1; clip-path: circle(52%  at 50% var(--land)); }
-    66%     { opacity: 1; clip-path: circle(92%  at 50% var(--land)); }
-    78%     { opacity: 1; clip-path: circle(135% at 50% var(--land)); }  /* eases into the far reaches */
-    100%    { opacity: 1; clip-path: circle(135% at 50% var(--land)); }
+    0%, 44% { opacity: 1; clip-path: inset(0 0 100% 0); }
+    52%     { opacity: 1; clip-path: inset(0 0 72%  0); }  /* top of "sharp" wells in */
+    62%     { opacity: 1; clip-path: inset(0 0 44%  0); }
+    74%     { opacity: 1; clip-path: inset(0 0 16%  0); }
+    86%     { opacity: 1; clip-path: inset(0 0 0    0); }  /* eases down to the baseline */
+    100%    { opacity: 1; clip-path: inset(0 0 0    0); }
   }
 
   @keyframes ss-btn-in {
@@ -153,7 +154,7 @@
     .stage.is-playing .replay { display: inline-flex; }
     .stage.is-playing .give-blood { display: inline-flex; }
     .ghost { opacity: 0; }
-    .fill  { opacity: 1; clip-path: circle(135% at 50% var(--land)); }
+    .fill  { opacity: 1; clip-path: inset(0 0 0 0); }
   }
 </style>
 </head>
