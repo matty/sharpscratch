@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sharp scratch</title>
+<meta name="description" content="sharp scratch — a cinematic blood-drop title sequence.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spectral:wght@700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --fs: clamp(60px, 11.5vw, 172px);   /* word size — shared so the offset scales with it */
+    /* --impact-y is the TOP edge of the word box; the drop must land a little
+       INTO the first line (onto the letters), not in the leading above them. */
+    --impact-y: 40vh;
+    --land: calc(var(--fs) * 0.30);     /* how far below the box top the drop hits the letters */
+    --blood: #d4392b;
+    --dur: 4.5s;
+  }
+
+  html, body { margin: 0; padding: 0; height: 100%; background: #0f0e0d; overflow: hidden; }
+  * { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; box-sizing: border-box; }
+
+  .stage {
+    position: fixed; inset: 0; background: #0f0e0d; overflow: hidden;
+    font-family: 'Spectral', Georgia, serif; cursor: default;
+  }
+
+  /* soft key light lifting the centre out of black */
+  .keylight {
+    position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(130% 110% at 50% 50%,
+      rgba(255,255,255,.05) 0%, rgba(255,255,255,0) 48%, rgba(0,0,0,.5) 100%);
+  }
+
+  /* the words, anchored so their TOP edge sits exactly on --impact-y */
+  .words {
+    position: absolute; left: 0; right: 0; top: var(--impact-y);
+    text-align: center; padding: 0 5vw;
+  }
+  .word-block {
+    position: relative; display: inline-block; font-weight: 800;
+    font-size: var(--fs); line-height: .88; letter-spacing: -.015em;
+  }
+
+  /* RESTING STATE (after the sequence has played): the finished red title. */
+  .ghost {
+    color: transparent; -webkit-text-stroke: 1.2px rgba(242,239,233,.16);
+    opacity: 0;
+  }
+  .fill {
+    position: absolute; inset: 0; color: var(--blood);
+    text-shadow: 0 0 18px rgba(212,57,43,.25);
+    opacity: 1; clip-path: circle(135% at 50% var(--land));
+  }
+  .drop {
+    position: absolute; top: 0; left: 50%;
+    width: 11px; height: 11px; margin: -6px 0 0 -5.5px; border-radius: 50%;
+    background: var(--blood); box-shadow: 0 0 12px rgba(212,57,43,.45);
+    transform-origin: center top; opacity: 0;
+  }
+
+  /* replay control — sits below the word, centred; visible only at rest */
+  .replay {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 54px; height: 54px; margin-top: clamp(34px, 6vh, 64px);
+    border-radius: 50%; border: 1px solid rgba(242,239,233,.22);
+    background: rgba(242,239,233,.02); color: rgba(242,239,233,.72);
+    cursor: pointer; -webkit-appearance: none; appearance: none; padding: 0;
+    transition: color .25s ease, border-color .25s ease, background .25s ease, transform .25s ease;
+    animation: ss-btn-in .55s ease both;
+  }
+  .replay:hover { color: var(--blood); border-color: rgba(212,57,43,.6); background: rgba(212,57,43,.06); transform: scale(1.06); }
+  .replay:active { transform: scale(.96); }
+  .replay:focus-visible { outline: 2px solid rgba(212,57,43,.6); outline-offset: 3px; }
+  .replay svg { width: 24px; height: 24px; display: block; }
+
+  /* call to action — appears bottom-right once the sequence has played */
+  .give-blood {
+    position: fixed; right: clamp(20px, 4vw, 48px); bottom: clamp(20px, 4vh, 40px);
+    display: inline-flex; align-items: center; gap: 9px;
+    padding: 14px 26px; border-radius: 8px;
+    background: var(--blood); color: #fff; text-decoration: none;
+    font-family: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+    font-weight: 600; font-size: 14.5px; letter-spacing: .14em; line-height: 1;
+    text-transform: uppercase;
+    transition: background .25s ease, color .25s ease, transform .2s ease;
+    animation: ss-btn-in .55s ease both;
+  }
+  .give-blood:hover { background: #fff; color: var(--blood); transform: translateY(-2px); }
+  .give-blood:active { transform: translateY(0); }
+  .give-blood:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+  .give-blood svg { width: 17px; height: 17px; display: block; }
+
+  /* cinematic grain */
+  .grain {
+    position: absolute; inset: 0; pointer-events: none; opacity: .06; mix-blend-mode: soft-light;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  /* ===== PLAYING STATE: run the one-shot sequence, hide the button ===== */
+  .stage.is-playing .replay,
+  .stage.is-playing .give-blood { display: none; }
+
+  .stage.is-playing .drop  { animation: ss-drip  var(--dur) linear      forwards; }
+  .stage.is-playing .ghost { animation: ss-ghost var(--dur) linear      forwards; }
+  .stage.is-playing .fill  { animation: ss-fill  var(--dur) linear      forwards; }
+
+  /* Bead wells at the top, swells, then drops FAST with gravity. At the 44%
+     impact frame its leading tip is exactly on --impact-y, then it bursts. */
+  @keyframes ss-drip {
+    0%, 6%  { opacity: 0; transform: translateY(0) scale(0); }
+    12%     { opacity: 1; transform: translateY(0) scale(1); }
+    28%     { opacity: 1; transform: translateY(0) scaleX(.92) scaleY(1.18); }
+    33%     { opacity: 1; transform: translateY(calc(var(--impact-y) * .12)) scaleX(.70) scaleY(1.95); }
+    38%     { opacity: 1; transform: translateY(calc(var(--impact-y) * .42)) scaleX(.74) scaleY(2.1); }
+    42%     { opacity: 1; transform: translateY(calc(var(--impact-y) * .80 + var(--land) * .80)) scaleX(.80) scaleY(1.85); }
+    44%     { opacity: 1; transform: translateY(calc(var(--impact-y) + var(--land))) scaleX(1.05) scaleY(.85); }
+    45%     { opacity: 0; transform: translateY(calc(var(--impact-y) + var(--land))) scaleX(1.7) scaleY(.35); }
+    100%    { opacity: 0; transform: translateY(calc(var(--impact-y) + var(--land))) scale(0); }
+  }
+
+  /* Outline appears the instant the drop lands, then fades as blood fills. */
+  @keyframes ss-ghost {
+    0%, 41% { opacity: 0; }
+    44%     { opacity: .5; }
+    66%     { opacity: .3; }
+    100%    { opacity: 0; }
+  }
+
+  /* Blood blooms OUTWARD from the impact point (top-centre of the word):
+     a circle that grows from radius 0 at the 44% impact frame, and stays. */
+  @keyframes ss-fill {
+    0%, 44% { opacity: 1; clip-path: circle(0%   at 50% var(--land)); }
+    48%     { opacity: 1; clip-path: circle(16%  at 50% var(--land)); }  /* small pool wells up where it lands */
+    56%     { opacity: 1; clip-path: circle(52%  at 50% var(--land)); }
+    66%     { opacity: 1; clip-path: circle(92%  at 50% var(--land)); }
+    78%     { opacity: 1; clip-path: circle(135% at 50% var(--land)); }  /* eases into the far reaches */
+    100%    { opacity: 1; clip-path: circle(135% at 50% var(--land)); }
+  }
+
+  @keyframes ss-btn-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Accessibility: show the finished title, no motion. */
+  @media (prefers-reduced-motion: reduce) {
+    .stage.is-playing .drop,
+    .stage.is-playing .ghost,
+    .stage.is-playing .fill { animation: none; }
+    .stage.is-playing .replay { display: inline-flex; }
+    .stage.is-playing .give-blood { display: inline-flex; }
+    .ghost { opacity: 0; }
+    .fill  { opacity: 1; clip-path: circle(135% at 50% var(--land)); }
+  }
+</style>
+</head>
+<body>
+  <div class="stage" id="stage">
+    <div class="keylight"></div>
+
+    <div class="words">
+      <div class="word-block">
+        <div class="ghost"><div>sharp</div><div>scratch</div></div>
+        <div class="fill"><div>sharp</div><div>scratch</div></div>
+      </div>
+      <div>
+        <button class="replay" id="replay" type="button" aria-label="Replay animation" title="Replay">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+            <polyline points="21 3 21 9 15 9"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="drop"></div>
+
+    <a class="give-blood" href="https://www.blood.co.uk" target="_blank" rel="noopener noreferrer">
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M12 2.5S5.5 10 5.5 14.8a6.5 6.5 0 0 0 13 0C18.5 10 12 2.5 12 2.5z"/>
+      </svg>
+      Give blood
+    </a>
+
+    <div class="grain"></div>
+  </div>
+
+  <script>
+    (function () {
+      var stage  = document.getElementById('stage');
+      var fill   = stage.querySelector('.fill');
+      var replay = document.getElementById('replay');
+      var timer  = null;
+
+      // read --dur (e.g. "4.5s") -> milliseconds
+      var durStr = getComputedStyle(document.documentElement).getPropertyValue('--dur').trim();
+      var durMs  = (parseFloat(durStr) || 4.5) * (durStr.indexOf('ms') > -1 ? 1 : 1000);
+
+      function settle() {            // reveal the replay button
+        clearTimeout(timer);
+        stage.classList.remove('is-playing');
+      }
+
+      function play() {              // restart the one-shot sequence
+        clearTimeout(timer);
+        stage.classList.remove('is-playing');
+        void stage.offsetWidth;      // force reflow so the animations restart
+        stage.classList.add('is-playing');
+        timer = setTimeout(settle, durMs + 60);
+      }
+
+      // animationend is the primary cue; the timer is a fallback
+      fill.addEventListener('animationend', function (e) {
+        if (e.animationName === 'ss-fill') settle();
+      });
+      replay.addEventListener('click', play);
+
+      play();                        // auto-play once on load (does not loop)
+    })();
+  </script>
+</body>
+</html>
