@@ -19,19 +19,18 @@
     --dur: 4.5s;
   }
 
-  html, body { margin: 0; padding: 0; height: 100%; background: #0f0e0d; overflow: hidden; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #030304; overflow: hidden; }
   * { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; box-sizing: border-box; }
 
   .stage {
-    position: fixed; inset: 0; background: #0f0e0d; overflow: hidden;
+    position: fixed; inset: 0; background: #030304; overflow: hidden;
     font-family: 'Spectral', Georgia, serif; cursor: default;
   }
 
-  /* soft key light lifting the centre out of black */
+  /* solid near-black backdrop */
   .keylight {
     position: absolute; inset: 0; pointer-events: none;
-    background: radial-gradient(130% 110% at 50% 50%,
-      rgba(255,255,255,.05) 0%, rgba(255,255,255,0) 48%, rgba(0,0,0,.5) 100%);
+    background: #030304;
   }
 
   /* the words, anchored so their TOP edge sits exactly on --impact-y */
@@ -49,10 +48,19 @@
     color: transparent; -webkit-text-stroke: 1.2px rgba(242,239,233,.16);
     opacity: 0;
   }
+  /* The blood reveals through a soft feathered mask that floods DOWN the word.
+     The gradient's fade zone is the wet leading edge — animating mask-position
+     slides it down smoothly, so the flow has no hard/jagged line. */
   .fill {
     position: absolute; inset: 0; color: var(--blood);
     text-shadow: 0 0 18px rgba(212,57,43,.25);
-    opacity: 1; clip-path: inset(0 0 0 0);
+    opacity: 1;
+    --bleed: linear-gradient(to bottom,
+      #000 0%, #000 48%, rgba(0,0,0,0) 53%, rgba(0,0,0,0) 100%);
+    -webkit-mask-image: var(--bleed);          mask-image: var(--bleed);
+    -webkit-mask-size: 100% 260%;              mask-size: 100% 260%;
+    -webkit-mask-repeat: no-repeat;            mask-repeat: no-repeat;
+    -webkit-mask-position: 0% 0%;              mask-position: 0% 0%;   /* resting = full */
   }
   .drop {
     position: absolute; top: 0; left: 50%;
@@ -107,6 +115,11 @@
   .stage.is-playing .ghost { animation: ss-ghost var(--dur) linear      forwards; }
   .stage.is-playing .fill  { animation: ss-fill  var(--dur) linear      forwards; }
 
+  /* When Motion.dev is available it drives the fill instead (richer, more
+     viscous flow), so suppress the CSS keyframe wipe to avoid a double reveal. */
+  .stage.motion.is-playing .fill { animation: none; }
+  .fill { will-change: -webkit-mask-position, mask-position; }
+
   /* Bead wells at the top, swells, then drops FAST with gravity. At the 44%
      impact frame its leading tip is exactly on --impact-y, then it bursts. */
   @keyframes ss-drip {
@@ -129,16 +142,11 @@
     100%    { opacity: 0; }
   }
 
-  /* Blood floods DOWN the letters from the top edge: the reveal starts the
-     instant the drop lands (44%) and the bottom inset retreats to 0, wiping
-     the red in top-to-bottom across the word. */
+  /* CSS fallback (used when Motion.dev isn't available): the soft mask edge
+     floods down from hidden (44%, the instant the drop lands) to full. */
   @keyframes ss-fill {
-    0%, 44% { opacity: 1; clip-path: inset(0 0 100% 0); }
-    52%     { opacity: 1; clip-path: inset(0 0 72%  0); }  /* top of "sharp" wells in */
-    62%     { opacity: 1; clip-path: inset(0 0 44%  0); }
-    74%     { opacity: 1; clip-path: inset(0 0 16%  0); }
-    86%     { opacity: 1; clip-path: inset(0 0 0    0); }  /* eases down to the baseline */
-    100%    { opacity: 1; clip-path: inset(0 0 0    0); }
+    0%, 44% { -webkit-mask-position: 0% 100%; mask-position: 0% 100%; }
+    100%    { -webkit-mask-position: 0% 0%;   mask-position: 0% 0%; }
   }
 
   @keyframes ss-btn-in {
@@ -154,7 +162,7 @@
     .stage.is-playing .replay { display: inline-flex; }
     .stage.is-playing .give-blood { display: inline-flex; }
     .ghost { opacity: 0; }
-    .fill  { opacity: 1; clip-path: inset(0 0 0 0); }
+    .fill  { opacity: 1; -webkit-mask-position: 0% 0%; mask-position: 0% 0%; }
   }
 </style>
 </head>
@@ -189,38 +197,81 @@
     <div class="grain"></div>
   </div>
 
-  <script>
-    (function () {
-      var stage  = document.getElementById('stage');
-      var fill   = stage.querySelector('.fill');
-      var replay = document.getElementById('replay');
-      var timer  = null;
+  <script type="module">
+    var stage  = document.getElementById('stage');
+    var fill   = stage.querySelector('.fill');
+    var replay = document.getElementById('replay');
+    var timer  = null;
 
-      // read --dur (e.g. "4.5s") -> milliseconds
-      var durStr = getComputedStyle(document.documentElement).getPropertyValue('--dur').trim();
-      var durMs  = (parseFloat(durStr) || 4.5) * (durStr.indexOf('ms') > -1 ? 1 : 1000);
+    // read --dur (e.g. "4.5s") -> milliseconds
+    var durStr = getComputedStyle(document.documentElement).getPropertyValue('--dur').trim();
+    var durMs  = (parseFloat(durStr) || 4.5) * (durStr.indexOf('ms') > -1 ? 1 : 1000);
 
-      function settle() {            // reveal the replay button
-        clearTimeout(timer);
-        stage.classList.remove('is-playing');
+    var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // The drop lands ~44% into the sequence — that's when blood starts flowing.
+    var IMPACT = 0.44 * durMs;
+
+    // The soft mask edge slides from fully hidden to fully revealed.
+    var HIDDEN = '0% 100%';
+    var FULL   = '0% 0%';
+
+    function setMask(pos) {        // set both prefixed + standard mask-position
+      fill.style.webkitMaskPosition = pos;
+      fill.style.maskPosition = pos;
+    }
+
+    function settle() {            // reveal the replay button, crisp final title
+      clearTimeout(timer);
+      setMask(FULL);
+      stage.classList.remove('is-playing');
+    }
+
+    // hide the blood up front so it doesn't flash full-red while Motion loads
+    if (!reduceMotion) setMask(HIDDEN);
+
+    var animate = null;
+    if (!reduceMotion) {
+      try {
+        ({ animate } = await import('https://cdn.jsdelivr.net/npm/motion@11.13.5/+esm'));
+        stage.classList.add('motion');
+      } catch (e) { animate = null; }   // fall back to the CSS keyframe wipe
+    }
+
+    function play() {              // restart the one-shot sequence
+      clearTimeout(timer);
+      stage.classList.remove('is-playing');
+      void stage.offsetWidth;      // force reflow so the CSS drop/ghost restart
+      stage.classList.add('is-playing');
+
+      if (animate) {
+        // Motion-driven blood flow: the soft mask edge floods down, decelerating
+        // viscously (easeOut) as the word fills — smooth, no jagged line.
+        setMask(HIDDEN);
+        var controls = animate(
+          fill,
+          { maskPosition: [HIDDEN, FULL], WebkitMaskPosition: [HIDDEN, FULL] },
+          { delay: IMPACT / 1000, duration: (durMs - IMPACT) / 1000,
+            ease: [0.22, 1, 0.36, 1] }
+        );
+        // safety net: always settle even if .finished never resolves
+        timer = setTimeout(function () { setMask(FULL); settle(); }, durMs + 250);
+        controls.finished.then(function () {
+          setMask(FULL);
+          settle();
+        }).catch(function () {});
+      } else {
+        timer = setTimeout(settle, durMs + 60);   // CSS fallback path
       }
+    }
 
-      function play() {              // restart the one-shot sequence
-        clearTimeout(timer);
-        stage.classList.remove('is-playing');
-        void stage.offsetWidth;      // force reflow so the animations restart
-        stage.classList.add('is-playing');
-        timer = setTimeout(settle, durMs + 60);
-      }
+    // animationend is the cue when the CSS wipe drives the fill (no Motion)
+    fill.addEventListener('animationend', function (e) {
+      if (!animate && e.animationName === 'ss-fill') settle();
+    });
+    replay.addEventListener('click', play);
 
-      // animationend is the primary cue; the timer is a fallback
-      fill.addEventListener('animationend', function (e) {
-        if (e.animationName === 'ss-fill') settle();
-      });
-      replay.addEventListener('click', play);
-
-      play();                        // auto-play once on load (does not loop)
-    })();
+    play();                        // auto-play once on load (does not loop)
   </script>
 </body>
 </html>
