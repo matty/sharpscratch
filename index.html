@@ -101,6 +101,24 @@
   .give-blood:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
   .give-blood svg { width: 17px; height: 17px; display: block; }
 
+  /* Until the renderer is chosen, keep the DOM title hidden so it can't flash a
+     full red word for a frame before the shader (or the CSS wipe) takes over. */
+  .stage.booting .ghost,
+  .stage.booting .fill { opacity: 0 !important; }
+
+  /* WebGL blood layer — the shader paints the filled letters here, overlaid
+     exactly on the word box. Hidden until the shader confirms it can run. */
+  .fill-gl {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    pointer-events: none; display: none;
+    filter: drop-shadow(0 0 6px rgba(212,57,43,.5));  /* tight glow, not a wide halo */
+  }
+  .stage.webgl .fill-gl { display: block; }
+  /* When the shader drives the blood, the DOM fill/ghost step aside so the
+     canvas is the only title — no doubled glyphs. */
+  .stage.webgl .ghost,
+  .stage.webgl .fill { opacity: 0 !important; animation: none !important; }
+
   /* cinematic grain */
   .grain {
     position: absolute; inset: 0; pointer-events: none; opacity: .06; mix-blend-mode: soft-light;
@@ -167,8 +185,10 @@
 </style>
 </head>
 <body>
-  <div class="stage" id="stage">
+  <noscript><style>.stage.booting .fill { opacity: 1 !important; }</style></noscript>
+  <div class="stage booting" id="stage">
     <div class="keylight"></div>
+    <canvas class="fill-gl" id="fillgl" aria-hidden="true"></canvas>
 
     <div class="words">
       <div class="word-block">
@@ -197,81 +217,505 @@
     <div class="grain"></div>
   </div>
 
+  <!-- ============================ BLOOD SHADER ============================
+       The fill is a custom WebGL2 fragment shader. The two words are rasterised
+       once into an offscreen 2D canvas (red channel = glyph, green = stroke),
+       uploaded as a texture, and the shader floods blood down through the
+       glyphs with a noisy viscous leading edge, running rivulets, pooling, and
+       a wet sheen riding the front. CSS still owns layout, the falling drop,
+       and the no-WebGL fallback (the original mask-gradient wipe).
+  -->
+  <script id="vert" type="x-shader/x-vertex">#version 300 es
+    in vec2 aPos;
+    out vec2 vUv;
+    void main() {
+      vUv = aPos * 0.5 + 0.5;
+      gl_Position = vec4(aPos, 0.0, 1.0);
+    }
+  </script>
+
+  <script id="frag" type="x-shader/x-fragment">#version 300 es
+    precision highp float;
+    in  vec2 vUv;
+    out vec4 fragColor;
+
+    uniform sampler2D uText;     // r = glyph coverage, g = stroke outline
+    uniform float uProgress;     // 0..1 eased fill amount
+    uniform float uTime;         // seconds, for the living wobble + sheen
+    uniform float uGhost;        // outline opacity (gated by progress in JS)
+    uniform vec2  uBand;         // (top, bottom) of the title, from-top fraction
+    uniform vec2  uRes;          // framebuffer size, for isotropic (aspect) noise
+
+    #define MAXBLOB 24
+    uniform vec4  uMouse[MAXBLOB];  // per pool: xy = pos (uv), z = strength, w = radius
+    uniform vec2  uMouseV[MAXBLOB]; // per pool: velocity (uv/s) — smears the pool along motion
+    uniform int   uMouseN;          // number of active pools
+
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+    float noise(vec2 p){
+      vec2 i = floor(p), f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+      float a = hash(i),               b = hash(i + vec2(1.0, 0.0));
+      float c = hash(i + vec2(0.0,1.0)), d = hash(i + vec2(1.0, 1.0));
+      return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    }
+    float fbm(vec2 p){
+      float v = 0.0, a = 0.5;
+      for (int i = 0; i < 5; i++){ v += a * noise(p); p = p * 2.0 + vec2(11.3, 7.1); a *= 0.5; }
+      return v;
+    }
+
+    // Wavy blood pools that trail the pointer and sink + fade. Rendered anywhere
+    // (not masked by the glyphs) so blood can flow across the whole page.
+    void mousePool(vec2 uv, float aspect, out vec3 col, out float a){
+      col = vec3(0.0); a = 0.0;
+      if (uMouseN <= 0) return;
+      vec2  p = vec2(uv.x * aspect, 1.0 - uv.y);         // mouse uv has y=0 at the top
+      float field = 0.0;
+      for (int i = 0; i < MAXBLOB; i++){
+        if (i >= uMouseN) break;
+        vec4 b = uMouse[i];                              // xy pos, z strength, w radius
+        vec2 d = p - vec2(b.x * aspect, b.y);
+        vec2 v = uMouseV[i] * vec2(aspect, 1.0);         // motion, in aspect space
+        float vlen = length(v);
+        if (vlen > 1e-4){                                // smear the pool along the push
+          vec2  dir   = v / vlen;
+          float push  = clamp(vlen * 0.55, 0.0, 2.2);
+          float dpar  = dot(d, dir) + push * b.w * 0.6;  // bias the tail behind the motion
+          float dperp = dot(d, vec2(-dir.y, dir.x));
+          d = vec2(dpar / (1.0 + push), dperp);          // elongate along the direction of travel
+        }
+        float dd = length(d) / max(b.w, 1e-4);
+        field += b.z * exp(-dd * dd * 2.2);              // soft blobs that merge into pools
+      }
+      // wavy, living edge
+      vec2  fp   = vec2(uv.x * 3.0, uv.y * 3.0 - uTime * 0.25);
+      float warp = fbm(fp + fbm(fp * 1.7 + 2.0)) - 0.5;
+      field *= 1.0 + warp * 0.35;
+      float th = 0.5;
+      a = smoothstep(th * 0.85, th * 1.25, field) * 0.9;
+      float core = smoothstep(th * 1.2, th * 2.6, field);
+      col = mix(vec3(0.30, 0.02, 0.02), vec3(0.86, 0.235, 0.175), core);
+      float rim = smoothstep(th * 1.3, th * 0.85, field);             // wet rim near the edge
+      col += vec3(1.0, 0.85, 0.80) * rim * 0.22;
+    }
+
+    void main(){
+      float aspect = uRes.x / uRes.y;
+
+      // -------------------- pointer blood pools (whole page) --------------------
+      vec3 mCol; float mA;
+      mousePool(vUv, aspect, mCol, mA);
+
+      // -------------------- the title fill (masked to the glyphs) ---------------
+      vec4 tx = texture(uText, vUv);
+      float glyph = tx.r, outline = tx.g;
+      vec3  tCol = vec3(0.0);
+      float tA   = 0.0;
+
+      if (glyph + outline > 0.003){
+        float yTop   = 1.0 - vUv.y;
+        float localY = clamp((yTop - uBand.x) / max(uBand.y - uBand.x, 1e-4), 0.0, 1.0);
+        float ax     = vUv.x * aspect;
+        float prog   = uProgress;
+
+        // Domain-warped flow that drifts DOWN over time + progress, so the whole
+        // sheet reads as running, not wobbling. The same warp threads through the
+        // edge shape AND the internal streaks, tying the surface together.
+        vec2  fp   = vec2(ax * 2.0, localY * 2.0 - uTime * 0.13 - prog * 0.6);
+        float warp = fbm(fp + fbm(fp * 1.7 + 3.0)) - 0.5;
+        float waveAmp = 1.0 - smoothstep(0.88, 1.0, prog);   // edge relaxes flat -> fully solid
+
+        // --- viscous top-down front: a wavy meniscus with rounded tongues and thin
+        //     threads that RUN downward (animated) — blood running down the strokes,
+        //     not a static edge that merely translates.
+        float wave   = fbm(vec2(ax * 1.3 + warp * 0.7, uTime * 0.10)) - 0.5;            // broad wavy edge
+        float lobes  = fbm(vec2(ax * 3.2 + warp * 0.6, uTime * 0.10 + 5.0));            // rounded tongues, alive
+        float fing   = smoothstep(0.40, 1.0, lobes);
+        float thrN   = fbm(vec2(ax * 8.0 + warp * 0.4, uTime * 0.14 + 9.0));            // a few thin threads
+        float thread = smoothstep(0.82, 1.0, thrN);
+        float run    = smoothstep(0.04, 0.45, prog) * waveAmp;                          // drips grow as it flows
+        float front  = prog * 1.16 - 0.10
+                     + wave   * 0.11 * waveAmp                                          // the wave
+                     + fing   * 0.20 * run                                              // tongues run ahead
+                     + thread * 0.32 * run;                                             // threads run furthest down
+        float ew   = 0.011 + 0.009 * (0.5 + warp);                                      // soft, living edge
+        float fill = smoothstep(front + ew, front - ew, localY);
+
+        // --- colour: venous deep -> arterial, with briskly downward-flowing streaks ---
+        float streak = fbm(vec2(ax * 4.5 + warp * 1.0, localY * 8.0 - uTime * 0.45 - prog * 2.0));
+        vec3  deep   = vec3(0.25, 0.016, 0.016);
+        vec3  midc   = vec3(0.58, 0.082, 0.062);
+        vec3  bright = vec3(0.87, 0.235, 0.175);             // fresh arterial ~#d4392b
+        vec3  blood  = mix(deep, midc, smoothstep(0.05, 0.60, streak));
+        blood = mix(blood, bright, smoothstep(0.55, 1.0, streak) * 0.8);
+        blood = mix(blood, deep, localY * 0.22);             // pools darker as it sinks
+
+        // --- wetness: a bright wet line riding the descending front + top gloss ---
+        float edge  = smoothstep(0.05, 0.0, abs(localY - front));
+        float sheen = edge * 0.5;
+        sheen += smoothstep(0.985, 1.0, fbm(vec2(ax * 16.0 + warp, localY * 16.0 - uTime * 0.5))) * fill * 0.4;
+        blood += vec3(1.00, 0.86, 0.80) * sheen;
+        blood += vec3(1.00, 0.92, 0.88) * pow(max(0.0, 1.0 - localY), 3.0) * 0.05;
+        blood = clamp(blood, 0.0, 1.4);
+
+        // Ghost stroke under, blood over (straight alpha — premultiplied at the end).
+        vec3  ghostCol = vec3(0.95, 0.94, 0.91);
+        float gA = outline * uGhost;
+        float bA = glyph * fill;
+        tA   = bA + gA * (1.0 - bA);
+        tCol = (blood * bA + ghostCol * gA * (1.0 - bA)) / max(tA, 1e-4);
+      }
+
+      // -------------------- composite: title over pools (premultiplied) ---------
+      float A = tA + mA * (1.0 - tA);
+      vec3  C = (tCol * tA + mCol * mA * (1.0 - tA)) / max(A, 1e-4);
+      fragColor = vec4(C * A, A);
+    }
+  </script>
+
   <script type="module">
-    var stage  = document.getElementById('stage');
-    var fill   = stage.querySelector('.fill');
-    var replay = document.getElementById('replay');
-    var timer  = null;
+    var stage   = document.getElementById('stage');
+    var canvas  = document.getElementById('fillgl');
+    var fillEl  = stage.querySelector('.fill');
+    var replay  = document.getElementById('replay');
 
     // read --dur (e.g. "4.5s") -> milliseconds
     var durStr = getComputedStyle(document.documentElement).getPropertyValue('--dur').trim();
     var durMs  = (parseFloat(durStr) || 4.5) * (durStr.indexOf('ms') > -1 ? 1 : 1000);
-
     var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     // The drop lands ~44% into the sequence — that's when blood starts flowing.
-    var IMPACT = 0.44 * durMs;
+    var IMPACT  = 0.44 * durMs;
+    var FILL_MS = 3800;            // blood-fill duration, decoupled from the drop — slow + viscous
+    var LINES   = ['sharp', 'scratch'];
 
-    // The soft mask edge slides from fully hidden to fully revealed.
-    var HIDDEN = '0% 100%';
-    var FULL   = '0% 0%';
+    function clamp01(x){ return x < 0 ? 0 : x > 1 ? 1 : x; }
+    function smooth01(x, a, b){ var t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); }
+    // Viscous flood: soft start (blood pools at impact), steady travel down the
+    // letters, soft settle — spreads the motion legibly across the whole window.
+    function easeFill(a){ return a * a * (3 - 2 * a); }
 
-    function setMask(pos) {        // set both prefixed + standard mask-position
-      fill.style.webkitMaskPosition = pos;
-      fill.style.maskPosition = pos;
-    }
+    // ---------------------------------------------------------------- WebGL
+    var gl = canvas.getContext('webgl2', { alpha: true, antialias: true, premultipliedAlpha: true });
 
-    function settle() {            // reveal the replay button, crisp final title
-      clearTimeout(timer);
-      setMask(FULL);
-      stage.classList.remove('is-playing');
-    }
+    var program, uni = {}, tex, maskCanvas, mctx;
+    var band = { x: 0.40, y: 0.60 };
+    var dpr = 1, glReady = false, resizeQueued = false;
+    var playing = false, playStart = 0, restProg = 0, startT = null, rafId = 0;
 
-    // hide the blood up front so it doesn't flash full-red while Motion loads
-    if (!reduceMotion) setMask(HIDDEN);
+    // ---- pointer blood: ONE cohesive pool that the cursor shoves around. As it
+    //      travels it sheds droplets that break off, drift under low gravity,
+    //      and fade. When the pointer stops, the whole thing fades away. ----------
+    var MAXBLOB  = 24;
+    var GRAV     = 0.16;                 // low gravity (uv/s^2, downward) — floaty sink
+    var DROP_TAU = 0.34;               // droplet velocity decay -> a shove, then a drift
+    var blobData = new Float32Array(MAXBLOB * 4);  // xy, strength, radius
+    var blobVel  = new Float32Array(MAXBLOB * 2);  // vx, vy
+    var mouseCount = 0, prevBlobT = null, shedAccum = 0;
 
-    var animate = null;
-    if (!reduceMotion) {
-      try {
-        ({ animate } = await import('https://cdn.jsdelivr.net/npm/motion@11.13.5/+esm'));
-        stage.classList.add('motion');
-      } catch (e) { animate = null; }   // fall back to the CSS keyframe wipe
-    }
+    var pool     = { x: 0.5, y: 0.5, vx: 0, vy: 0, energy: 0, r: 0.075, seeded: false };
+    var cursor   = { x: 0.5, y: 0.5, vx: 0, vy: 0, t: 0, lastMove: -1e9 };
+    var droplets = [];                   // { x, y, vx, vy, born, life, r }
 
-    function play() {              // restart the one-shot sequence
-      clearTimeout(timer);
-      stage.classList.remove('is-playing');
-      void stage.offsetWidth;      // force reflow so the CSS drop/ghost restart
-      stage.classList.add('is-playing');
-
-      if (animate) {
-        // Motion-driven blood flow: the soft mask edge floods down, decelerating
-        // viscously (easeOut) as the word fills — smooth, no jagged line.
-        setMask(HIDDEN);
-        var controls = animate(
-          fill,
-          { maskPosition: [HIDDEN, FULL], WebkitMaskPosition: [HIDDEN, FULL] },
-          { delay: IMPACT / 1000, duration: (durMs - IMPACT) / 1000,
-            ease: [0.22, 1, 0.36, 1] }
-        );
-        // safety net: always settle even if .finished never resolves
-        timer = setTimeout(function () { setMask(FULL); settle(); }, durMs + 250);
-        controls.finished.then(function () {
-          setMask(FULL);
-          settle();
-        }).catch(function () {});
-      } else {
-        timer = setTimeout(settle, durMs + 60);   // CSS fallback path
+    function onPointerMove(x, y, now){
+      var vx = 0, vy = 0;
+      if (cursor.t){
+        var ddt = Math.max(0.001, (now - cursor.t) / 1000);
+        vx = (x - cursor.x) / ddt; vy = (y - cursor.y) / ddt;   // cursor velocity (uv/s)
       }
+      cursor.x = x; cursor.y = y; cursor.vx = vx; cursor.vy = vy;
+      cursor.t = now; cursor.lastMove = now;
+      if (!pool.seeded){ pool.x = x; pool.y = y; pool.seeded = true; }
     }
 
-    // animationend is the cue when the CSS wipe drives the fill (no Motion)
-    fill.addEventListener('animationend', function (e) {
-      if (!animate && e.animationName === 'ss-fill') settle();
-    });
-    replay.addEventListener('click', play);
+    function shedDroplet(now){           // a bit of the pool breaks off, with a random kick
+      var pmag  = Math.sqrt(pool.vx * pool.vx + pool.vy * pool.vy) + 1e-4;
+      var perpx = -pool.vy / pmag, perpy = pool.vx / pmag;       // sideways to the travel
+      var kick  = (Math.random() - 0.5) * 0.45;                  // random break-up
+      var keep  = 0.25 + Math.random() * 0.35;                   // some forward momentum
+      droplets.push({
+        x: pool.x + (Math.random() - 0.5) * pool.r,
+        y: pool.y + (Math.random() - 0.5) * pool.r,
+        vx: pool.vx * keep + perpx * kick,
+        vy: pool.vy * keep + perpy * kick,
+        born: now, life: 0.55 + Math.random() * 0.7,
+        r: pool.r * (0.28 + Math.random() * 0.4)
+      });
+      if (droplets.length > MAXBLOB - 1) droplets.shift();
+    }
 
-    play();                        // auto-play once on load (does not loop)
+    function updateBlobs(now){            // move the pool, shed + integrate droplets, pack
+      var dt = prevBlobT === null ? 0 : Math.min(0.05, (now - prevBlobT) / 1000);
+      prevBlobT = now;
+      var n = 0;
+
+      if (pool.seeded){
+        var idle = (now - cursor.lastMove) / 1000;
+        if (idle > 0.05){ cursor.vx *= 0.9; cursor.vy *= 0.9; } // forget stale velocity when still
+        // Target leads AHEAD of the cursor along its travel, so the cursor pushes it.
+        var cmag = Math.sqrt(cursor.vx * cursor.vx + cursor.vy * cursor.vy);
+        var lead = Math.min(0.07, cmag * 0.05);
+        var tx = cursor.x + (cmag > 1e-3 ? cursor.vx / cmag * lead : 0);
+        var ty = cursor.y + (cmag > 1e-3 ? cursor.vy / cmag * lead : 0);
+        // Ease the pool toward the target — a cohesive, springy follow.
+        var k  = dt > 0 ? (1 - Math.exp(-dt / 0.07)) : 0;
+        var nx = pool.x + (tx - pool.x) * k;
+        var ny = pool.y + (ty - pool.y) * k;
+        pool.vx = dt > 0 ? (nx - pool.x) / dt : 0;
+        pool.vy = dt > 0 ? (ny - pool.y) / dt : 0;
+        pool.x = nx; pool.y = ny;
+        var speed = Math.sqrt(pool.vx * pool.vx + pool.vy * pool.vy);
+        // Movement keeps the pool alive; stillness lets it fade out.
+        if (idle < 0.10) pool.energy = Math.min(1, pool.energy + dt * 5);
+        else pool.energy = Math.max(0, pool.energy - dt * 1.1);
+        // Break-up: shed droplets in proportion to distance travelled.
+        shedAccum += speed * dt;
+        while (shedAccum > 0.05 && droplets.length < MAXBLOB - 1){ shedAccum -= 0.05; shedDroplet(now); }
+        if (pool.energy > 0.02){
+          var o = n * 4, o2 = n * 2;
+          blobData[o] = pool.x; blobData[o + 1] = pool.y; blobData[o + 2] = pool.energy; blobData[o + 3] = pool.r;
+          blobVel[o2] = pool.vx; blobVel[o2 + 1] = pool.vy;
+          n++;
+        }
+      }
+
+      for (var i = 0; i < droplets.length && n < MAXBLOB; i++){
+        var d   = droplets[i];
+        var age = (now - d.born) / 1000;
+        if (age >= d.life) continue;
+        d.vy += GRAV * dt;                                   // low gravity
+        var drag = Math.exp(-dt / DROP_TAU);
+        d.vx *= drag; d.vy *= drag;
+        d.x += d.vx * dt; d.y += d.vy * dt;
+        var p = n * 4, p2 = n * 2;
+        blobData[p] = d.x; blobData[p + 1] = d.y;
+        blobData[p + 2] = Math.pow(1 - age / d.life, 1.3) * 0.85;  // fade out
+        blobData[p + 3] = d.r;
+        blobVel[p2] = d.vx; blobVel[p2 + 1] = d.vy;
+        n++;
+      }
+      droplets = droplets.filter(function (d){ return (now - d.born) / 1000 < d.life; });
+      mouseCount = n;
+    }
+
+    function compile(type, src){
+      var s = gl.createShader(type);
+      gl.shaderSource(s, src.trim());
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    }
+
+    function buildMask(){
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      var W = Math.max(1, Math.floor(window.innerWidth  * dpr));
+      var H = Math.max(1, Math.floor(window.innerHeight * dpr));
+      canvas.width = W; canvas.height = H;                 // GL framebuffer
+
+      // Anti-aliasing: rasterise the glyphs into a SUPERSAMPLED mask (2× the
+      // framebuffer, capped to the GPU limit), then downsample with trilinear
+      // mipmapping at draw time — crisp letter edges at any size.
+      var maxSide = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096, 4096);
+      var ss = Math.min(2, maxSide / W, maxSide / H);
+      ss = ss < 1 ? 1 : ss;
+      var MW = Math.max(1, Math.round(W * ss));
+      var MH = Math.max(1, Math.round(H * ss));
+
+      if (!maskCanvas){ maskCanvas = document.createElement('canvas'); mctx = maskCanvas.getContext('2d'); }
+      maskCanvas.width = MW; maskCanvas.height = MH;
+
+      // resolve the live font metrics (the clamp()'d size, family, weight), then
+      // scale them into mask-space. Normalised UVs keep the shader mapping intact.
+      var wb = stage.querySelector('.word-block');
+      var cs = getComputedStyle(wb);
+      var fs = parseFloat(cs.fontSize) * dpr * ss;
+      var lh = fs * 0.88;                              // matches CSS line-height
+      var impactY = 0.40 * MH;                         // = --impact-y (40vh)
+      var ascent  = fs * 0.74;                         // baseline ≈ top + ascent
+
+      mctx.clearRect(0, 0, MW, MH);
+      mctx.globalCompositeOperation = 'lighter';       // channels add independently
+      mctx.textAlign = 'center';
+      mctx.textBaseline = 'alphabetic';
+      mctx.font = (cs.fontWeight || '800') + ' ' + fs + 'px ' + cs.fontFamily;
+      try { mctx.letterSpacing = (-0.015 * fs) + 'px'; } catch (e) {}
+      mctx.lineJoin = 'round';
+      mctx.lineWidth = Math.max(1.0, 1.2 * dpr * ss);
+
+      for (var i = 0; i < LINES.length; i++){
+        var y = impactY + ascent + lh * i;
+        mctx.strokeStyle = 'rgb(0,255,0)';  mctx.strokeText(LINES[i], MW / 2, y); // outline -> g
+        mctx.fillStyle   = 'rgb(255,0,0)';  mctx.fillText(LINES[i], MW / 2, y);   // glyph   -> r
+      }
+
+      band.x = impactY / MH;
+      band.y = (impactY + lh * (LINES.length - 1) + fs) / MH;
+
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, maskCanvas);
+      gl.generateMipmap(gl.TEXTURE_2D);                 // for trilinear downsample
+      gl.viewport(0, 0, W, H);
+    }
+
+    async function initGL(){
+      if (!gl) throw new Error('no webgl2');
+      program = gl.createProgram();
+      gl.attachShader(program, compile(gl.VERTEX_SHADER,   document.getElementById('vert').textContent));
+      gl.attachShader(program, compile(gl.FRAGMENT_SHADER, document.getElementById('frag').textContent));
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+      gl.useProgram(program);
+
+      var buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      var aPos = gl.getAttribLocation(program, 'aPos');
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+      ['uText', 'uProgress', 'uTime', 'uGhost', 'uBand', 'uRes', 'uMouseN'].forEach(function (n){
+        uni[n] = gl.getUniformLocation(program, n);
+      });
+      uni.uMouse  = gl.getUniformLocation(program, 'uMouse[0]');
+      uni.uMouseV = gl.getUniformLocation(program, 'uMouseV[0]');
+
+      tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); // trilinear
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      var aniso = gl.getExtension('EXT_texture_filter_anisotropic');
+      if (aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT,
+                                  Math.min(8, gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);     // premultiplied over page
+      gl.clearColor(0, 0, 0, 0);
+
+      await preloadFonts();                              // raster the real Spectral face
+      buildMask();
+      draw(0, 0, 0);                                     // warm-up: force GPU compile/upload
+      gl.finish();                                       // before the first visible frame
+      glReady = true;
+    }
+
+    // Preload the exact faces the mask needs so the first frame never rasterises
+    // a fallback serif, and the sequence only starts once they're resident.
+    async function preloadFonts(){
+      try {
+        if (document.fonts && document.fonts.load){
+          await Promise.all([
+            document.fonts.load('800 100px "Spectral"'),
+            document.fonts.load('700 100px "Spectral"')
+          ]);
+        }
+        await document.fonts.ready;
+      } catch (e) {}
+    }
+
+    function draw(p, t, ghost){
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.uniform1f(uni.uProgress, p);
+      gl.uniform1f(uni.uTime, t);
+      gl.uniform1f(uni.uGhost, ghost);
+      gl.uniform2f(uni.uBand, band.x, band.y);
+      gl.uniform2f(uni.uRes, canvas.width, canvas.height);
+      gl.uniform1i(uni.uMouseN, mouseCount);
+      gl.uniform4fv(uni.uMouse, blobData);
+      gl.uniform2fv(uni.uMouseV, blobVel);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.uniform1i(uni.uText, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
+    function frame(now){
+      rafId = requestAnimationFrame(frame);
+      if (resizeQueued && glReady){ resizeQueued = false; buildMask(); }
+      if (startT === null) startT = now;
+      var t = (now - startT) / 1000;
+      updateBlobs(performance.now());
+
+      var p;
+      if (playing){
+        var el = now - playStart;
+        var a  = (el - IMPACT) / FILL_MS;
+        p = a <= 0 ? 0 : a >= 1 ? 1 : easeFill(a);
+        if (el >= IMPACT + FILL_MS + 40){ playing = false; p = 1; settle(); }
+      } else {
+        p = restProg;
+      }
+      // ghost stroke is gated to the fill: 0 before impact, flashes in, fades out
+      var ghost = (1 - p) * 0.55 * smooth01(p, 0.0, 0.05);
+      draw(p, t, ghost);
+    }
+
+    function settle(){          // crisp final title, bring the controls back
+      restProg = 1;
+      stage.classList.remove('is-playing');
+    }
+
+    function play(){            // restart the one-shot sequence
+      stage.classList.remove('is-playing');
+      void stage.offsetWidth;   // reflow so the CSS drop/ghost keyframes restart
+      stage.classList.add('is-playing');
+      playStart = performance.now();
+      playing = true; restProg = 0;
+      if (!rafId) rafId = requestAnimationFrame(frame);
+    }
+
+    window.addEventListener('resize', function (){ resizeQueued = true; });
+    document.addEventListener('visibilitychange', function (){
+      if (document.hidden){ cancelAnimationFrame(rafId); rafId = 0; }
+      else if (!rafId){ startT = null; rafId = requestAnimationFrame(frame); }
+    });
+
+    // ----------------------------------------------- CSS / no-WebGL fallback
+    function runCssFallback(){
+      stage.classList.remove('booting');
+      var HIDDEN = '0% 100%', FULL = '0% 0%', timer = null;
+      function setMask(pos){ fillEl.style.webkitMaskPosition = pos; fillEl.style.maskPosition = pos; }
+      function done(){ clearTimeout(timer); setMask(FULL); stage.classList.remove('is-playing'); }
+      function run(){
+        clearTimeout(timer);
+        stage.classList.remove('is-playing'); void stage.offsetWidth;
+        stage.classList.add('is-playing');
+        setMask(HIDDEN);
+        timer = setTimeout(done, durMs + 60);   // CSS ss-fill keyframe drives the wipe
+      }
+      fillEl.addEventListener('animationend', function (e){ if (e.animationName === 'ss-fill') done(); });
+      replay.addEventListener('click', run);
+      if (reduceMotion){ setMask(FULL); } else { run(); }
+    }
+
+    // ------------------------------------------------------------------ boot
+    (async function (){
+      var ok = false;
+      if (gl){ try { await initGL(); ok = true; } catch (e){ ok = false; console.warn('blood shader unavailable:', e); } }
+
+      if (ok){
+        stage.classList.add('webgl');
+        stage.classList.remove('booting');
+        replay.addEventListener('click', function (){ if (!reduceMotion) play(); });
+
+        // Pointer blood: the cursor shoves a cohesive pool that breaks up + fades.
+        // Disabled under reduced-motion.
+        if (!reduceMotion){
+          window.addEventListener('pointermove', function (e){
+            onPointerMove(e.clientX / window.innerWidth, e.clientY / window.innerHeight, performance.now());
+            if (!rafId){ startT = null; rafId = requestAnimationFrame(frame); } // wake if idle
+          }, { passive: true });
+        }
+
+        if (reduceMotion){ restProg = 1; rafId = requestAnimationFrame(frame); }  // static finished title
+        else { play(); }                                                          // auto-play once
+      } else {
+        runCssFallback();
+      }
+    })();
   </script>
 </body>
 </html>
